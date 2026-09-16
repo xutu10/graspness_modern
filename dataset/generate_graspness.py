@@ -5,6 +5,7 @@ import scipy.io as scio
 import sys
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
+sys.path.insert(0, os.path.join(ROOT_DIR, 'graspnetAPI'))
 from utils.data_utils import get_workspace_mask, CameraInfo, create_point_cloud_from_depth_image
 from utils.knn_utils import knn_query
 import torch
