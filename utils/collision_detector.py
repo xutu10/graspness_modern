@@ -83,11 +83,11 @@ class ModelFreeCollisionDetector():
         inner_mask = mask_z_height & mask_x_depth & (~mask_y_left_finger_max) & (~mask_y_right_finger_min)
         inner_volume = (heights * self.finger_length * widths / (self.voxel_size**3)).reshape(-1)
 
-        empty_mask = (inner_mask.sum(axis=-1)/max(inner_volume, self.EPSILON) < empty_thresh)
-        global_iou = global_mask.sum(axis=1) / max(volume, self.EPSILON)
-        left_iou = left_mask.sum(axis=1) / max(left_right_volume, self.EPSILON)
-        right_iou = right_mask.sum(axis=1) / max(left_right_volume, self.EPSILON)
-        bottom_iou = bottom_mask.sum(axis=1) / max(bottom_volume, self.EPSILON)
+        empty_mask = (inner_mask.sum(axis=-1) / np.maximum(inner_volume, self.EPSILON) < empty_thresh)
+        global_iou = global_mask.sum(axis=1) / np.maximum(volume, self.EPSILON)
+        left_iou = left_mask.sum(axis=1) / np.maximum(left_right_volume, self.EPSILON)
+        right_iou = right_mask.sum(axis=1) / np.maximum(left_right_volume, self.EPSILON)
+        bottom_iou = bottom_mask.sum(axis=1) / np.maximum(bottom_volume, self.EPSILON)
 
         return {
             "global_mask": global_mask, 
@@ -115,7 +115,7 @@ class ModelFreeCollisionDetector():
                     [global_iou, left_iou, right_iou, bottom_iou, shifting_iou]
     
         """
-        self._check_data_valid(self, grasp_group, self.scene_points)
+        self._check_data_valid(grasp_group, self.scene_points)
 
         T = grasp_group.translations
         R = grasp_group.rotation_matrices
@@ -127,7 +127,7 @@ class ModelFreeCollisionDetector():
         targets = self.scene_points[np.newaxis,:,:] - T[:,np.newaxis,:]
         targets = np.matmul(targets, R)
         
-        mask_iou_dict = self._comput_mask_and_volume(targets, heights, depths, widths, empty_thresh)
+        mask_iou_dict = self._compute_mask_and_iou(targets, heights, depths, widths, empty_thresh)
         collision_mask = (mask_iou_dict["global_iou"] > collision_thresh)
 
         if not (return_empty_grasp or return_ious): 
