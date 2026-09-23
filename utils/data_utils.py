@@ -3,6 +3,7 @@
 """
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 
 class CameraInfo():
@@ -19,138 +20,125 @@ class CameraInfo():
 
 
 def create_point_cloud_from_depth_image(depth, camera, organized=True):
-    """ Generate point cloud using depth image only.
+    """Project a depth image into camera coordinates.
 
-        Input:
-            depth: [numpy.ndarray, (H,W), numpy.float32]
-                depth image
-            camera: [CameraInfo]
-                camera intrinsics
-            organized: bool
-                whether to keep the cloud in image shape (H,W,3)
-
-        Output:
-            cloud: [numpy.ndarray, (H,W,3)/(H*W,3), numpy.float32]
-                generated cloud, (H,W,3) for organized=True, (H*W,3) for organized=False
+    Organized output preserves the image layout, including invalid depth
+    pixels. Unorganized output drops non-finite and non-positive depths.
     """
-    assert (depth.shape[0] == camera.height and depth.shape[1] == camera.width)
-    xmap = np.arange(camera.width)
-    ymap = np.arange(camera.height)
-    xmap, ymap = np.meshgrid(xmap, ymap)
-    points_z = depth / camera.scale
-    points_x = (xmap - camera.cx) * points_z / camera.fx
-    points_y = (ymap - camera.cy) * points_z / camera.fy
-    cloud = np.stack([points_x, points_y, points_z], axis=-1)
+   
+    if depth.shape != 2 or depth.shape[0] !=  camera.height or depth.shape[1] != camera.width:
+        raise ValueError(f'depth must have shape ({camera.height}, {camera.width}), got {depth.shape}')
+    if camera.scale == 0 or camera.fx == 0 or camera.fy == 0:
+        raise ValueError('camera scale, fx, and fy must be non-zero')
+
+    rows, cols = np.indices((int(camera.height), int(camera.width)))
+    depth_m = depth / camera.scale
+    cloud = np.empty((int(camera.height), int(camera.width), 3))
+    cloud[..., 0] = (cols - camera.cx) * depth_m / camera.fx
+    cloud[..., 1] = (rows - camera.cy) * depth_m / camera.fy
+    cloud[..., 2] = depth_m
+
+    valid = np.isfinite(depth_m) & (depth_m > 0)
+    cloud = cloud[valid]
+
     if not organized:
-        cloud = cloud.reshape([-1, 3])
+        return cloud.reshape([-1,3])
+
     return cloud
 
 
 def transform_point_cloud(cloud, transform, format='4x4'):
-    """ Transform points to new coordinates with transformation matrix.
+    """Apply a rigid transform to a set of 3D points.
 
-        Input:
-            cloud: [np.ndarray, (N,3), np.float32]
-                points in original coordinates
-            transform: [np.ndarray, (3,3)/(3,4)/(4,4), np.float32]
-                transformation matrix, could be rotation only or rotation+translation
-            format: [string, '3x3'/'3x4'/'4x4']
-                the shape of transformation matrix
-                '3x3' --> rotation matrix
-                '3x4'/'4x4' --> rotation matrix + translation matrix
-
-        Output:
-            cloud_transformed: [np.ndarray, (N,3), np.float32]
-                points in new coordinates
+    Supported transform shapes:
+        - '3x3': rotation matrix only
+        - '3x4': rotation + translation
+        - '4x4': rotation + translation
     """
-    if not (format == '3x3' or format == '4x4' or format == '3x4'):
-        raise ValueError('Unknown transformation format, only support \'3x3\' or \'4x4\' or \'3x4\'.')
+    cloud = np.asarray(cloud, dtype=np.float32)
+    transform = np.asarray(transform, dtype=np.float32)
+
+    if cloud.ndim != 2 or cloud.shape[1] != 3:
+        raise ValueError(f'cloud must have shape (N, 3), got {cloud.shape}')
+    if format not in ('3x3', '3x4', '4x4'):
+        raise ValueError("Unknown transformation format, only support '3x3', '3x4', or '4x4'.")
+    if format == '3x3' and transform.shape != (3, 3):
+        raise ValueError(f'transform must have shape (3, 3) for format=\'3x3\', got {transform.shape}')
+    if format in ('3x4', '4x4') and transform.shape not in ((3, 4), (4, 4)):
+        raise ValueError(f'transform must have shape (3, 4) or (4, 4) for format=\'{format}\', got {transform.shape}')
+
     if format == '3x3':
-        cloud_transformed = np.dot(transform, cloud.T).T
-    elif format == '4x4' or format == '3x4':
-        ones = np.ones(cloud.shape[0])[:, np.newaxis]
-        cloud_ = np.concatenate([cloud, ones], axis=1)
-        cloud_transformed = np.dot(transform, cloud_.T).T
-        cloud_transformed = cloud_transformed[:, :3]
-    return cloud_transformed
+        return (transform @ cloud.T).T
 
-
-def compute_point_dists(A, B):
-    """ Compute pair-wise point distances in two matrices.
-
-        Input:
-            A: [np.ndarray, (N,3), np.float32]
-                point cloud A
-            B: [np.ndarray, (M,3), np.float32]
-                point cloud B
-
-        Output:
-            dists: [np.ndarray, (N,M), np.float32]
-                distance matrix
-    """
-    A = A[:, np.newaxis, :]
-    B = B[np.newaxis, :, :]
-    dists = np.linalg.norm(A - B, axis=-1)
-    return dists
+    ones = np.ones((cloud.shape[0], 1), dtype=np.float32)
+    cloud_h = np.hstack((cloud, ones))
+    transformed = (transform @ cloud_h.T).T
+    return transformed[:, :3]
 
 
 def remove_invisible_grasp_points(cloud, grasp_points, pose, th=0.01):
-    """ Remove invisible part of object model according to scene point cloud.
+    """Return grasp points that are within ``th`` of the scene cloud.
 
-        Input:
-            cloud: [np.ndarray, (N,3), np.float32]
-                scene point cloud
-            grasp_points: [np.ndarray, (M,3), np.float32]
-                grasp point label in object coordinates
-            pose: [np.ndarray, (4,4), np.float32]
-                transformation matrix from object coordinates to world coordinates
-            th: [float]
-                if the minimum distance between a grasp point and the scene points is greater than outlier, the point will be removed
-
-        Output:
-            visible_mask: [np.ndarray, (M,), np.bool]
-                mask to show the visible part of grasp points
+    Distance calculations are chunked to avoid allocating the full pairwise
+    distance matrix for large scenes and grasp sets.
     """
+    if cloud.ndim != 2 or cloud.shape[1] != 3:
+        raise ValueError(f'cloud must have shape (N, 3), got {cloud.shape}')
+    if grasp_points.ndim != 2 or grasp_points.shape[1] != 3:
+        raise ValueError(
+            f'grasp_points must have shape (M, 3), got {grasp_points.shape}')
+    if pose.shape not in ((3, 4), (4, 4)):
+        raise ValueError(f'pose must have shape (3, 4) or (4, 4), got {pose.shape}')
+   
     grasp_points_trans = transform_point_cloud(grasp_points, pose)
-    dists = compute_point_dists(grasp_points_trans, cloud)
-    min_dists = dists.min(axis=1)
-    visible_mask = (min_dists < th)
+    tree = cKDTree(cloud)
+    min_dists, _ = tree.query(grasp_points_trans, k=1, return_distance=True)
+    visible_mask = min_dists < th
+
     return visible_mask
 
 
 def get_workspace_mask(cloud, seg, trans=None, organized=True, outlier=0):
-    """ Keep points in workspace as input.
+    """Keep points in the foreground workspace as a boolean mask.
 
-        Input:
-            cloud: [np.ndarray, (H,W,3), np.float32]
-                scene point cloud
-            seg: [np.ndarray, (H,W,), np.uint8]
-                segmantation label of scene points
-            trans: [np.ndarray, (4,4), np.float32]
-                transformation matrix for scene points, default: None.
-            organized: [bool]
-                whether to keep the cloud in image shape (H,W,3)
-            outlier: [float]
-                if the distance between a point and workspace is greater than outlier, the point will be removed
-                
-        Output:
-            workspace_mask: [np.ndarray, (H,W)/(H*W,), np.bool]
-                mask to indicate whether scene points are in workspace
+    Args:
+        cloud: scene points, either (H, W, 3) or (N, 3)
+        seg: segmentation mask with same spatial shape as cloud for organized data,
+            or a length-N label vector for flattened data
+        trans: optional transform applied to points before computing the workspace
+        organized: if True, preserve the original (H, W) mask layout
+        outlier: padding added to the workspace bounds
+
+    Returns:
+        A boolean mask of shape (H, W) when organized=True, otherwise (N,)
     """
+  
     if organized:
-        h, w, _ = cloud.shape
-        cloud = cloud.reshape([h * w, 3])
-        seg = seg.reshape(h * w)
+        if cloud.ndim != 3 or cloud.shape[2] != 3:
+            raise ValueError(f'cloud must have shape (H, W, 3) when organized=True, got {cloud.shape}')
+        if seg.shape != cloud.shape[:2]:
+            raise ValueError(f'seg must have shape {cloud.shape[:2]}, got {seg.shape}')
+        h,w,_ = cloud.shape
+        cloud_flat = cloud.reshape(h*w, 3)
+        seg_flat = seg.reshape(h*w)
+
     if trans is not None:
-        cloud = transform_point_cloud(cloud, trans)
-    foreground = cloud[seg > 0]
+        cloud_flat = transform_point_cloud(cloud_flat, trans)
+
+    foreground = cloud_flat[seg_flat > 0]
+    if foreground.size == 0:
+        if organized:
+            return np.zeros((h, w), dtype=bool)
+        return np.zeros(cloud_flat.shape[0], dtype=bool)
+
     xmin, ymin, zmin = foreground.min(axis=0)
     xmax, ymax, zmax = foreground.max(axis=0)
-    mask_x = ((cloud[:, 0] > xmin - outlier) & (cloud[:, 0] < xmax + outlier))
-    mask_y = ((cloud[:, 1] > ymin - outlier) & (cloud[:, 1] < ymax + outlier))
-    mask_z = ((cloud[:, 2] > zmin - outlier) & (cloud[:, 2] < zmax + outlier))
-    workspace_mask = (mask_x & mask_y & mask_z)
-    if organized:
-        workspace_mask = workspace_mask.reshape([h, w])
 
+    mask_x = (cloud_flat[:, 0] >= xmin - outlier) & (cloud_flat[:, 0] <= xmax + outlier)
+    mask_y = (cloud_flat[:, 1] >= ymin - outlier) & (cloud_flat[:, 1] <= ymax + outlier)
+    mask_z = (cloud_flat[:, 2] >= zmin - outlier) & (cloud_flat[:, 2] <= zmax + outlier)
+    workspace_mask = mask_x & mask_y & mask_z
+
+    if organized:
+        return workspace_mask.reshape(h, w)
     return workspace_mask
