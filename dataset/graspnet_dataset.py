@@ -208,7 +208,7 @@ class GraspNetDataset(Dataset):
         elif split == 'test_seen':
             self.sceneIds = list(range(100, 130))  # scenes 110-129 for test_seen evaluation
         elif split == 'test_seen_single':
-            self.sceneIds = list(range(181, 182))  # Just scene_0181
+            self.sceneIds = list(range(126, 127))  # Just scene_0126
         elif split == 'test_seen_mini':
             self.sceneIds = [101, 115, 128]  # Mini test_seen subset
         elif split == 'test_similar':
@@ -225,6 +225,13 @@ class GraspNetDataset(Dataset):
             self.sceneIds = [0, 50, 80]  # Mini train subset for sanity checks
         self.sceneIds = ['scene_{}'.format(str(x).zfill(4)) for x in self.sceneIds]
 
+        # Training scenes use the canonical layout. Test scenes are distributed
+        # under test_images, grouped by the official evaluation split.
+        self.scene_data_roots = {
+            scene: self._get_scene_data_root(scene)
+            for scene in self.sceneIds
+        }
+
         self.depthpath = []
         self.rgbpath = []  # RGB image paths
         self.labelpath = []
@@ -233,16 +240,33 @@ class GraspNetDataset(Dataset):
         self.frameid = []
         self.graspnesspath = []
         for x in tqdm(self.sceneIds, desc='Loading data paths...'):
+            scene_root = self.scene_data_roots[x]
             for img_num in range(view_start, view_end):
-                self.depthpath.append(os.path.join(root, 'scenes', x, camera, 'depth', str(img_num).zfill(4) + '.png'))
-                self.rgbpath.append(os.path.join(root, 'scenes', x, camera, 'rgb', str(img_num).zfill(4) + '.png'))
-                self.labelpath.append(os.path.join(root, 'scenes', x, camera, 'label', str(img_num).zfill(4) + '.png'))
-                self.metapath.append(os.path.join(root, 'scenes', x, camera, 'meta', str(img_num).zfill(4) + '.mat'))
+                self.depthpath.append(os.path.join(scene_root, x, camera, 'depth', str(img_num).zfill(4) + '.png'))
+                self.rgbpath.append(os.path.join(scene_root, x, camera, 'rgb', str(img_num).zfill(4) + '.png'))
+                self.labelpath.append(os.path.join(scene_root, x, camera, 'label', str(img_num).zfill(4) + '.png'))
+                self.metapath.append(os.path.join(scene_root, x, camera, 'meta', str(img_num).zfill(4) + '.mat'))
                 # Use graspness_full/ when include_floor=True, otherwise use graspness/
                 graspness_subdir = 'graspness_full' if self.include_floor else 'graspness'
                 self.graspnesspath.append(os.path.join(root, graspness_subdir, x, camera, str(img_num).zfill(4) + '.npy'))
                 self.scenename.append(x.strip())
                 self.frameid.append(img_num)
+
+    def _get_scene_data_root(self, scene):
+        """Return the directory containing a scene's camera data."""
+        scene_id = int(scene.rsplit('_', 1)[-1])
+        if scene_id < 100:
+            return os.path.join(self.root, 'scenes')
+        if scene_id < 130:
+            test_split = 'test_seen'
+        elif scene_id < 160:
+            test_split = 'test_similar'
+        else:
+            test_split = 'test_novel'
+        return os.path.join(self.root, 'test_images', test_split)
+
+    def _scene_camera_path(self, scene):
+        return os.path.join(self.scene_data_roots[scene], scene, self.camera)
             
     def scene_list(self):
         return self.scenename
@@ -372,8 +396,9 @@ class GraspNetDataset(Dataset):
         # get valid points
         depth_mask = (depth > 0)
         if self.remove_outlier:
-            camera_poses = np.load(os.path.join(self.root, 'scenes', scene, self.camera, 'camera_poses.npy'))
-            align_mat = np.load(os.path.join(self.root, 'scenes', scene, self.camera, 'cam0_wrt_table.npy'))
+            camera_path = self._scene_camera_path(scene)
+            camera_poses = np.load(os.path.join(camera_path, 'camera_poses.npy'))
+            align_mat = np.load(os.path.join(camera_path, 'cam0_wrt_table.npy'))
             trans = np.dot(align_mat, camera_poses[self.frameid[index]])
             workspace_mask = get_workspace_mask(cloud, seg, trans=trans, organized=True, outlier=0.02)
             mask = (depth_mask & workspace_mask)
@@ -446,8 +471,9 @@ class GraspNetDataset(Dataset):
         # get valid points
         depth_mask = (depth > 0)
         if self.remove_outlier:
-            camera_poses = np.load(os.path.join(self.root, 'scenes', scene, self.camera, 'camera_poses.npy'))
-            align_mat = np.load(os.path.join(self.root, 'scenes', scene, self.camera, 'cam0_wrt_table.npy'))
+            camera_path = self._scene_camera_path(scene)
+            camera_poses = np.load(os.path.join(camera_path, 'camera_poses.npy'))
+            align_mat = np.load(os.path.join(camera_path, 'cam0_wrt_table.npy'))
             trans = np.dot(align_mat, camera_poses[self.frameid[index]])
             workspace_mask = get_workspace_mask(cloud, seg, trans=trans, organized=True, outlier=0.02)
             mask = (depth_mask & workspace_mask)
