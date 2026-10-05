@@ -1,5 +1,5 @@
-""" Tools for loss computation.
-    Author: chenxi-wang
+"""
+    Helper functions for label generation and ApproachNet.
 """
 
 import torch
@@ -14,108 +14,79 @@ M_POINT = 1024
 
 
 def transform_point_cloud(cloud, transform, format='4x4'):
-    """ Transform points to new coordinates with transformation matrix.
+    """Apply a rotation to an (N, 3) point cloud.
 
-        Input:
-            cloud: [torch.FloatTensor, (N,3)]
-                points in original coordinates
-            transform: [torch.FloatTensor, (3,3)/(3,4)/(4,4)]
-                transformation matrix, could be rotation only or rotation+translation
-            format: [string, '3x3'/'3x4'/'4x4']
-                the shape of transformation matrix
-                '3x3' --> rotation matrix
-                '3x4'/'4x4' --> rotation matrix + translation matrix
-
-        Output:
-            cloud_transformed: [torch.FloatTensor, (N,3)]
-                points in new coordinates
+    For translation formats, either a (3, 4) or (4, 4) matrix is
+    accepted.
     """
-    if not (format == '3x3' or format == '4x4' or format == '3x4'):
-        raise ValueError('Unknown transformation format, only support \'3x3\' or \'4x4\' or \'3x4\'.')
-    if format == '3x3':
-        cloud_transformed = torch.matmul(transform, cloud.T).T
-    elif format == '4x4' or format == '3x4':
-        ones = cloud.new_ones(cloud.size(0), device=cloud.device).unsqueeze(-1)
-        cloud_ = torch.cat([cloud, ones], dim=1)
-        cloud_transformed = torch.matmul(transform, cloud_.T).T
-        cloud_transformed = cloud_transformed[:, :3]
-    return cloud_transformed
+   
+    if format not in ('3x3', '3x4', '4x4'):
+        raise ValueError(
+            "Unknown transformation format; expected '3x3', '3x4', or '4x4'."
+        )
+    if cloud.ndim != 2 or cloud.shape[1] != 3:
+        raise ValueError(f'cloud must have shape (N, 3), got {tuple(cloud.shape)}')
+
+    transformed = cloud @ transform[:3, :3].T
+    if format != '3x3':
+        transformed = transformed + transform[:3, 3]
+
+    return transformed
 
 
 def generate_grasp_views(N=300, phi=(np.sqrt(5) - 1) / 2, center=np.zeros(3), r=1):
-    """ View sampling on a unit sphere using Fibonacci lattices.
-        Ref: https://arxiv.org/abs/0912.4540
+    """Sample N points on a sphere using a Fibonacci lattice.
 
-        Input:
-            N: [int]
-                number of sampled views
-            phi: [float]
-                constant for view coordinate calculation, different phi's bring different distributions, default: (sqrt(5)-1)/2
-            center: [np.ndarray, (3,), np.float32]
-                sphere center
-            r: [float]
-                sphere radius
-
-        Output:
-            views: [torch.FloatTensor, (N,3)]
-                sampled view coordinates
+    Returns a float32 tensor with shape (N, 3).
     """
-    views = []
-    for i in range(N):
-        zi = (2 * i + 1) / N - 1
-        xi = np.sqrt(1 - zi ** 2) * np.cos(2 * i * np.pi * phi)
-        yi = np.sqrt(1 - zi ** 2) * np.sin(2 * i * np.pi * phi)
-        views.append([xi, yi, zi])
-    views = r * np.array(views) + center
+    
+    indices = np.arange(N, dtype=np.float64)
+    z = (2 * indices + 1) / N - 1
+    radial = np.sqrt(1 - z ** 2)
+    phase = 2 * indices * np.pi * phi
+    views = np.stack(
+        (radial * np.cos(phase), radial * np.sin(phase), z),
+        axis=-1,
+    )
+    views = r * views + center
+
     return torch.from_numpy(views.astype(np.float32))
 
 
-def batch_viewpoint_params_to_matrix(batch_towards, batch_angle):
-    """ Transform approach vectors and in-plane rotation angles to rotation matrices.
+def batch_viewpoint_params_to_matrix(batch_template_view, batch_angle):
+    """Convert template views and in-plane angles to rotation matrices."""
+    
+    if batch_template_view.ndim != 2 or batch_template_view.shape[1] != 3:
+        raise ValueError(
+            f'ndim of batch_template_view must be 2 and second dimension must be 3, got {tuple(batch_template_view.shape)}'
+        )
+    if batch_angle.ndim != 1 or batch_angle.shape[0] != batch_template_view.shape[0]:
+        raise ValueError(
+            f'batch_angle must have same shape as batch_template_view first dimension, got {tuple(batch_angle.shape)}'
+        )
+    
+    axis_x_norm = torch.linalg.vector_norm(batch_template_view, dim=-1, keepdim=True)
+    if torch.any(axis_x_norm == 0):
+        raise ValueError('batch_template_view vectors must be non-zero')
+    axis_x = batch_template_view / axis_x_norm
 
-        Input:
-            batch_towards: [torch.FloatTensor, (N,3)]
-                approach vectors in batch
-            batch_angle: [torch.floatTensor, (N,)]
-                in-plane rotation angles in batch
-                
-        Output:
-            batch_matrix: [torch.floatTensor, (N,3,3)]
-                rotation matrices in batch
-    """
-    axis_x = batch_towards
-    ones = torch.ones(axis_x.shape[0], dtype=axis_x.dtype, device=axis_x.device)
-    zeros = torch.zeros(axis_x.shape[0], dtype=axis_x.dtype, device=axis_x.device)
-    axis_y = torch.stack([-axis_x[:, 1], axis_x[:, 0], zeros], dim=-1)
-    mask_y = (torch.norm(axis_y, dim=-1) == 0)
+    zeros = torch.zeros_like(axis_x[:, 0])
+    axis_y = torch.stack((-axis_x[:, 1], axis_x[:, 0], zeros), dim=-1)
+    # handle the case where axis_x is aligned with the z-axis to avoid division by zero(No need due to Fibonacci lattice)
+    mask_y = torch.linalg.vector_norm(axis_y, dim=-1) == 0
     axis_y[mask_y, 1] = 1
-    axis_x = axis_x / torch.norm(axis_x, dim=-1, keepdim=True)
-    axis_y = axis_y / torch.norm(axis_y, dim=-1, keepdim=True)
-    axis_z = torch.linalg.cross(axis_x, axis_y)
-    sin = torch.sin(batch_angle)
-    cos = torch.cos(batch_angle)
-    R1 = torch.stack([ones, zeros, zeros, zeros, cos, -sin, zeros, sin, cos], dim=-1)
-    R1 = R1.reshape([-1, 3, 3])
-    R2 = torch.stack([axis_x, axis_y, axis_z], dim=-1)
-    batch_matrix = torch.matmul(R2, R1)
-    return batch_matrix
+    axis_y = axis_y / torch.linalg.vector_norm(axis_y, dim=-1, keepdim=True)    
+    axis_z = torch.linalg.cross(axis_x, axis_y, dim=-1)
 
+    sin_angle = torch.sin(batch_angle)
+    cos_angle = torch.cos(batch_angle)
+    ones = torch.ones_like(cos_angle)
+    in_plane_rotation = torch.stack(
+        (ones, zeros, zeros, zeros, cos_angle, -sin_angle,
+         zeros, sin_angle, cos_angle),
+        dim=-1,
+    ).reshape(-1, 3, 3)
+    basis = torch.stack((axis_x, axis_y, axis_z), dim=-1)
 
-def huber_loss(error, delta=1.0):
-    """
-    Args:
-        error: Torch tensor (d1,d2,...,dk)
-    Returns:
-        loss: Torch tensor (d1,d2,...,dk)
+    return basis @ in_plane_rotation
 
-    x = error = pred - gt or dist(pred,gt)
-    0.5 * |x|^2                 if |x|<=d
-    0.5 * d^2 + d * (|x|-d)     if |x|>d
-    Author: Charles R. Qi
-    Ref: https://github.com/charlesq34/frustum-pointnets/blob/master/models/model_util.py
-    """
-    abs_error = torch.abs(error)
-    quadratic = torch.clamp(abs_error, max=delta)
-    linear = (abs_error - quadratic)
-    loss = 0.5 * quadratic ** 2 + delta * linear
-    return loss
