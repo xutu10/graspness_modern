@@ -136,7 +136,8 @@ def match_grasp_view_and_label(end_points):
     selected_view_inds = top_view_inds.view(B, Ns, 1, 1, 1).expand(-1, -1, 1, A, D) # prepare for gather, dimensions converted (B,Ns) to (B, Ns, 1, A, D)
     end_points['batch_grasp_width'] = torch.gather(widths, 2, selected_view_inds).squeeze(2) # (B, Ns, A, D), dropped view dimension
     end_points['batch_grasp_score'] = torch.gather(scores, 2, selected_view_inds).squeeze(2) # (B, Ns, A, D), dropped view dimension
-
+    
+    # transform raw grasp scores(0-1, best-worst) to a normalized score (0-1, worst-best) for training
     view_grasp_scores = end_points['batch_grasp_score']
     positive = view_grasp_scores > 0
     if positive.any():
