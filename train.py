@@ -124,6 +124,9 @@ parser.add_argument('--no_translation_aug', action='store_true', default=False,
                     help='Disable random translation in data augmentation (paper uses no translation) [default: False]')
 parser.add_argument('--use_val', action='store_true', default=False,
                     help='Enable validation: use train_reduced (95 scenes) for training and val_train (5 scenes) for validation [default: False]')
+parser.add_argument('--early_stopping_patience', type=int, default=0,
+                    help='Stop after this many validation epochs without improvement; 0 disables early stopping')
+
 # DDP arguments (set automatically by torchrun, but can be overridden)
 parser.add_argument('--local_rank', type=int, default=-1,
                     help='Local rank for distributed training (set by torchrun)')
@@ -214,6 +217,17 @@ def log_string(out_str):
         LOG_FOUT.write(out_str + '\n')
         LOG_FOUT.flush()
         print(out_str)
+
+
+def update_early_stopping(val_loss, state, min_delta, patience):
+    """Update early-stopping state and return whether the patience is exhausted."""
+    if val_loss < state['best_val_loss'] - min_delta:
+        state['best_val_loss'] = val_loss
+        state['epochs_without_improvement'] = 0
+        return False
+
+    state['epochs_without_improvement'] += 1
+    return state['epochs_without_improvement'] >= patience
 
 
 # Init datasets and dataloaders 
@@ -441,6 +455,10 @@ def create_model_and_optimizer():
         log_string("Using Automatic Mixed Precision (AMP) training")
 
     start_epoch = 0
+    early_stopping_state = {
+        'best_val_loss': float('inf'),
+        'epochs_without_improvement': 0,
+    }
     if CHECKPOINT_PATH is not None and os.path.isfile(CHECKPOINT_PATH):
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
         # Handle both DDP and non-DDP checkpoints
@@ -461,6 +479,13 @@ def create_model_and_optimizer():
             if 'scaler_state_dict' in checkpoint and cfgs.use_amp:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
             start_epoch = checkpoint['epoch']
+            if cfgs.early_stopping_patience > 0:
+                early_stopping_state['best_val_loss'] = checkpoint.get(
+                    'best_val_loss', float('inf'))
+                early_stopping_state['best_val_loss'] = float(
+                    early_stopping_state['best_val_loss'])
+                early_stopping_state['epochs_without_improvement'] = int(checkpoint.get(
+                    'epochs_without_improvement', 0))
             log_string("-> loaded checkpoint %s (epoch: %d)" % (CHECKPOINT_PATH, start_epoch))
     
     # Wrap model in DDP if running distributed
@@ -471,7 +496,7 @@ def create_model_and_optimizer():
                   find_unused_parameters=True)
         log_string(f"Model wrapped in DistributedDataParallel (device_ids=[{LOCAL_RANK}])")
     
-    return net, optimizer, scaler, start_epoch, device
+    return net, optimizer, scaler, start_epoch, device, early_stopping_state
 
 
 def get_current_lr(epoch, base_lr):
@@ -520,7 +545,7 @@ def train_one_epoch(net, optimizer, scaler, device, train_dataloader, train_writ
     # Only show progress bar on main process to avoid duplicates
     data_iter = tqdm(enumerate(train_dataloader), desc='Training', 
                      disable=not is_main_process(), total=len(train_dataloader))
-    
+    # One batch dict produced by dataloader
     for batch_idx, batch_data_label in data_iter:
             
         # Transfer to GPU with non_blocking=True for async copy (works with pin_memory=True)
@@ -612,6 +637,7 @@ def train_one_epoch(net, optimizer, scaler, device, train_dataloader, train_writ
 def validate_one_epoch(net, device, val_dataloader, val_writer):
     """Run validation and return average loss."""
     stat_dict = {}
+    num_batches = 0
     net.eval()
     
     data_iter = tqdm(enumerate(val_dataloader), desc='Validation',
@@ -646,6 +672,7 @@ def validate_one_epoch(net, device, val_dataloader, val_writer):
             raise  # Re-raise other RuntimeErrors
         
         # Accumulate statistics
+        num_batches += 1
         for key in end_points:
             if 'loss' in key or 'acc' in key or 'prec' in key or 'recall' in key or 'count' in key:
                 if key not in stat_dict:
@@ -653,7 +680,8 @@ def validate_one_epoch(net, device, val_dataloader, val_writer):
                 stat_dict[key] += end_points[key].item()
     
     # Compute averages and log
-    num_batches = len(val_dataloader)
+    if num_batches == 0 or 'loss/overall_loss' not in stat_dict:
+        raise RuntimeError('Validation produced no overall loss; cannot compute validation loss')
     log_string(' ---- Validation Results ----')
     for key in sorted(stat_dict.keys()):
         avg_value = stat_dict[key] / num_batches
@@ -668,8 +696,14 @@ def validate_one_epoch(net, device, val_dataloader, val_writer):
 
 
 def train(start_epoch, net, optimizer, scaler, device, train_dataloader,
-          train_writer, train_sampler=None, val_dataloader=None, val_writer=None):
+          train_writer, train_sampler=None, val_dataloader=None, val_writer=None,
+          early_stopping_state=None):
     global EPOCH_CNT
+    if early_stopping_state is None:
+        early_stopping_state = {
+            'best_val_loss': float('inf'),
+            'epochs_without_improvement': 0,
+        }
     
     for epoch in range(start_epoch, cfgs.max_epoch):
         # Set epoch on distributed sampler for proper shuffling
@@ -695,8 +729,24 @@ def train(start_epoch, net, optimizer, scaler, device, train_dataloader,
         train_loss = train_one_epoch(net, optimizer, scaler, device, train_dataloader, train_writer)
         
         # Run validation if enabled
+        should_stop = False
         if val_dataloader is not None:
             val_loss = validate_one_epoch(net, device, val_dataloader, val_writer)
+            if cfgs.early_stopping_patience > 0:
+                if is_distributed():
+                    val_loss_tensor = torch.tensor(val_loss, dtype=torch.float64, device=device)
+                    dist.broadcast(val_loss_tensor, src=0)
+                    val_loss = val_loss_tensor.item()
+                if not math.isfinite(val_loss):
+                    raise RuntimeError(f'Validation loss is not finite: {val_loss}')
+                should_stop = update_early_stopping(
+                    val_loss, early_stopping_state, cfgs.early_stopping_min_delta,
+                    cfgs.early_stopping_patience)
+                log_string(
+                    f"Early stopping: best val loss={early_stopping_state['best_val_loss']:.6f}, "
+                    f"epochs without improvement="
+                    f"{early_stopping_state['epochs_without_improvement']}/"
+                    f"{cfgs.early_stopping_patience}")
             log_string(f'Epoch {epoch} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}')
         
         # Save regular checkpoint (only from main process)
@@ -705,8 +755,14 @@ def train(start_epoch, net, optimizer, scaler, device, train_dataloader,
             model_to_save = net.module if is_distributed() else net
             save_dict = {'epoch': epoch + 1, 'optimizer_state_dict': optimizer.state_dict(),
                          'model_state_dict': model_to_save.state_dict(),
-                         'scaler_state_dict': scaler.state_dict()}
+                         'scaler_state_dict': scaler.state_dict(),
+                         'best_val_loss': early_stopping_state['best_val_loss'],
+                         'epochs_without_improvement': early_stopping_state['epochs_without_improvement']}
             torch.save(save_dict, os.path.join(cfgs.log_dir, cfgs.model_name + '_epoch' + str(epoch + 1).zfill(2) + '.tar'))
+
+        if should_stop:
+            log_string(f'Early stopping triggered after epoch {epoch + 1}')
+            break
 
 
 if __name__ == '__main__':
@@ -714,7 +770,7 @@ if __name__ == '__main__':
     TRAIN_DATALOADER, TRAIN_SAMPLER, VAL_DATALOADER = create_dataloaders()
     
     # Create model, optimizer, and scaler (each process creates its own for DDP)
-    net, optimizer, scaler, start_epoch, device = create_model_and_optimizer()
+    net, optimizer, scaler, start_epoch, device, early_stopping_state = create_model_and_optimizer()
     
     # TensorBoard Visualizers (only main process writes to TensorBoard)
     if is_main_process():
@@ -727,7 +783,7 @@ if __name__ == '__main__':
     # Start training
     try:
         train(start_epoch, net, optimizer, scaler, device, TRAIN_DATALOADER,
-              TRAIN_WRITER, TRAIN_SAMPLER, VAL_DATALOADER, VAL_WRITER)
+              TRAIN_WRITER, TRAIN_SAMPLER, VAL_DATALOADER, VAL_WRITER, early_stopping_state)
     finally:
         # Ensure TensorBoard writers are properly closed
         if is_main_process():
