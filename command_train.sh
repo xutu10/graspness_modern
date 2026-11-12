@@ -25,6 +25,7 @@
 #   --camera          : realsense | kinect
 #   --train_split     : train | train_all | train_reduced (95 scenes when using --use_val)
 #   --use_val         : Enable validation (reserves 5 scenes for validation)
+#   --early_stopping_patience : Stop after this many validation epochs without improvement (requires --use_val)
 #   --num_point       : Number of points to sample (default: 15000)
 #   --graspness_threshold : Threshold for graspness filtering (default: 0.1)
 #   --include_floor   : Include floor/table points (requires generate_graspness_full.py)
