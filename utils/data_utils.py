@@ -26,10 +26,7 @@ def create_point_cloud_from_depth_image(depth, camera, organized=True):
     pixels. Unorganized output drops non-finite and non-positive depths.
     """
    
-    if depth.shape != 2 or depth.shape[0] !=  camera.height or depth.shape[1] != camera.width:
-        raise ValueError(f'depth must have shape ({camera.height}, {camera.width}), got {depth.shape}')
-    if camera.scale == 0 or camera.fx == 0 or camera.fy == 0:
-        raise ValueError('camera scale, fx, and fy must be non-zero')
+    assert (depth.shape[0] == camera.height and depth.shape[1] == camera.width)
 
     rows, cols = np.indices((int(camera.height), int(camera.width)))
     depth_m = depth / camera.scale
@@ -38,13 +35,12 @@ def create_point_cloud_from_depth_image(depth, camera, organized=True):
     cloud[..., 1] = (rows - camera.cy) * depth_m / camera.fy
     cloud[..., 2] = depth_m
 
+    if organized:
+        return cloud
+    
     valid = np.isfinite(depth_m) & (depth_m > 0)
-    cloud = cloud[valid]
 
-    if not organized:
-        return cloud.reshape([-1,3])
-
-    return cloud
+    return cloud[valid]
 
 
 def transform_point_cloud(cloud, transform, format='4x4'):
