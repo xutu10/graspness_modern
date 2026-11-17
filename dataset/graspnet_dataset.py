@@ -67,6 +67,8 @@ class SceneAwareSampler(Sampler):
 
         self.scene_to_indices = {}
         for idx, scene in enumerate(dataset.scenename):
+            if scene not in self.scene_to_indices:
+                self.scene_to_indices[scene] = []
             self.scene_to_indices[scene].append(idx)
 
         self.scenes = list(self.scene_to_indices.keys())
